@@ -1,0 +1,2416 @@
+
+==================================================
+ARCHIVO: .\agents.py
+==================================================
+from __future__ import annotations
+
+"""Author: Omar Portilla Jaimes
+Email: jorge.portilla2@unipamplona.edu.co
+"""
+
+from dataclasses import dataclass
+from typing import List, Tuple
+import random
+import uuid
+
+@dataclass
+class Proposal:
+    arg_id: str
+    hypothesis: str
+    confidence: float
+
+class SpecialistAgent:
+    def __init__(self, agent_id: str, accuracy: float,
+                 conf_correct: Tuple[float, float], conf_wrong: Tuple[float, float],
+                 attack_rate: float, target_expert_bias: float = 0.0, overconfident: bool = False):
+        self.agent_id = agent_id
+        self.accuracy = accuracy
+        self.conf_correct = conf_correct
+        self.conf_wrong = conf_wrong
+        self.attack_rate = attack_rate
+        self.target_expert_bias = target_expert_bias
+        self.overconfident = overconfident
+
+    def propose(self, hypotheses: List[str], ground_truth: str) -> Proposal:
+        correct = (random.random() < self.accuracy)
+        if correct:
+            h = ground_truth
+            lo, hi = self.conf_correct
+        else:
+            h = random.choice([x for x in hypotheses if x != ground_truth])
+            lo, hi = self.conf_wrong
+        conf = random.uniform(lo, hi)
+        if self.overconfident and not correct:
+            conf = max(conf, 0.80)
+        return Proposal(arg_id=f"ARG-{self.agent_id}-{uuid.uuid4().hex[:8]}", hypothesis=h, confidence=conf)
+
+
+==================================================
+ARCHIVO: .\argumentation.py
+==================================================
+from __future__ import annotations
+
+"""Author: Omar Portilla Jaimes
+Email: jorge.portilla2@unipamplona.edu.co
+"""
+
+from dataclasses import dataclass
+from typing import Dict, Set, Tuple
+
+@dataclass(frozen=True)
+class Argument:
+    arg_id: str
+    agent_id: str
+    hypothesis: str
+    confidence: float
+
+class AF:
+    def __init__(self):
+        self.args: Dict[str, Argument] = {}
+        self.attacks: Set[Tuple[str, str]] = set()  # (from,to)
+
+    def add_argument(self, a: Argument) -> None:
+        self.args[a.arg_id] = a
+
+    def add_attack(self, frm: str, to: str) -> None:
+        if frm in self.args and to in self.args and frm != to:
+            self.attacks.add((frm, to))
+
+    def attackers_of(self, a_id: str) -> Set[str]:
+        return {u for (u, v) in self.attacks if v == a_id}
+
+def defends(af: AF, S: Set[str], a_id: str) -> bool:
+    for b in af.attackers_of(a_id):
+        if not any((c, b) in af.attacks for c in S):
+            return False
+    return True
+
+def grounded_extension(af: AF) -> Set[str]:
+    S: Set[str] = set()
+    changed = True
+    while changed:
+        S_new = {a for a in af.args.keys() if defends(af, S, a)}
+        changed = (S_new != S)
+        S = S_new
+    return S
+
+def induced_defeat_graph(af: AF, weights: Dict[str, float], lam: float) -> AF:
+    rep = AF()
+    for a in af.args.values():
+        rep.add_argument(a)
+    for (u, v) in af.attacks:
+        if weights[u] >= lam * weights[v]:
+            rep.add_attack(u, v)
+    return rep
+
+
+==================================================
+ARCHIVO: .\cli.py
+==================================================
+from __future__ import annotations
+
+"""Author: Omar Portilla Jaimes
+Email: jorge.portilla2@unipamplona.edu.co
+"""
+
+import argparse
+import json
+import os
+from typing import Any, Dict, List
+
+from .simulation import run_compare, summarize_results
+from .pipeline import run_full_pipeline, run_sensitivity, analyze_sensitivity
+
+def _json_arg(s: str) -> Dict[str, Any]:
+    if not s:
+        return {}
+    return json.loads(s)
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="cadis-sroa2",
+        description="CADIS SROA Rep2 — Prototype v5 (Dung grounded vs Dung+Reputation hybrid).",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # compare
+    c = sub.add_parser("compare", help="Run one warmup+test compare and write run_summary.xlsx")
+    c.add_argument("--outdir", required=True)
+    c.add_argument("--seed", type=int, default=7)
+    c.add_argument("--warmup", type=int, default=200)
+    c.add_argument("--test", type=int, default=200)
+    c.add_argument("--lam", "--lambda", dest="lam", type=float, default=1.25)
+    c.add_argument("--gamma", type=float, default=2.0)
+    c.add_argument("--omega", type=float, default=0.8)
+    c.add_argument("--forgetting", type=float, default=0.01, help="Forgetting rate f (eta_equivalent = 1-f)")
+    c.add_argument("--coalition-size", type=int, default=2)
+    c.add_argument("--include-adversary", action="store_true", default=True)
+    c.add_argument("--no-adversary", dest="include_adversary", action="store_false")
+    c.add_argument("--drop-rate", type=float, default=0.0)
+    c.add_argument("--dup-rate", type=float, default=0.0)
+    c.add_argument("--scenario-overrides", type=_json_arg, default={})
+    # trace policy
+    c.add_argument("--trace-level", choices=["none", "audit", "full"], default="audit")
+    c.add_argument("--audit-max-cases", type=int, default=30)
+    c.add_argument("--audit-policy", choices=["diff", "pure_fail", "hybrid_fail", "random"], default="diff")
+    c.add_argument("--use-sqlite", action="store_true", default=False, help="Only meaningful with --trace-level full")
+    # logging
+    c.add_argument("--log-every-cases", type=int, default=200)
+
+    # sensitivity (standalone)
+    s = sub.add_parser("sensitivity", help="Run LHS sensitivity and write metrics.xlsx")
+    s.add_argument("--outdir", required=True)
+    s.add_argument("--regimes", nargs="+", default=["R0_default", "R1_expert_degraded", "R3_more_adversarial"])
+    s.add_argument("--seeds", nargs="+", type=int, default=[7, 11, 13, 17, 19])
+    s.add_argument("--n-samples", type=int, default=180)
+    s.add_argument("--warmup", type=int, default=200)
+    s.add_argument("--test", type=int, default=200)
+    s.add_argument("--lam-min", type=float, default=1.0)
+    s.add_argument("--lam-max", type=float, default=1.8)
+    s.add_argument("--gamma-min", type=float, default=0.0)
+    s.add_argument("--gamma-max", type=float, default=4.0)
+    s.add_argument("--omega-min", type=float, default=0.0)
+    s.add_argument("--omega-max", type=float, default=1.0)
+    s.add_argument("--design-seed", type=int, default=123)
+    s.add_argument("--forgetting", type=float, default=0.01)
+    s.add_argument("--coalition-size", type=int, default=2)
+    s.add_argument("--include-adversary", action="store_true", default=True)
+    s.add_argument("--no-adversary", dest="include_adversary", action="store_false")
+    s.add_argument("--drop-rate", type=float, default=0.0)
+    s.add_argument("--dup-rate", type=float, default=0.0)
+    s.add_argument("--log-every-runs", type=int, default=10)
+    s.add_argument("--max-workers", type=int, default=1)
+
+    # analyze
+    a = sub.add_parser("analyze", help="Analyze sensitivity outputs and write prcc.xlsx and pareto_front.xlsx")
+    a.add_argument("--outdir", required=True)
+    a.add_argument("--regimes", nargs="+", default=["R0_default", "R1_expert_degraded", "R3_more_adversarial"])
+
+    # pipeline
+    pl = sub.add_parser("pipeline", help="Run baseline + sensitivity + analysis + paper_outputs")
+    pl.add_argument("--outdir", required=True)
+    pl.add_argument("--regimes", nargs="+", default=["R0_default", "R1_expert_degraded", "R3_more_adversarial"])
+    pl.add_argument("--seeds", nargs="+", type=int, default=[7, 11, 13, 17, 19])
+    pl.add_argument("--n-samples", type=int, default=180)
+    pl.add_argument("--warmup", type=int, default=200)
+    pl.add_argument("--test", type=int, default=200)
+    pl.add_argument("--lam-min", type=float, default=1.0)
+    pl.add_argument("--lam-max", type=float, default=1.8)
+    pl.add_argument("--gamma-min", type=float, default=0.0)
+    pl.add_argument("--gamma-max", type=float, default=4.0)
+    pl.add_argument("--omega-min", type=float, default=0.0)
+    pl.add_argument("--omega-max", type=float, default=1.0)
+    pl.add_argument("--design-seed", type=int, default=123)
+    pl.add_argument("--forgetting", type=float, default=0.01)
+    pl.add_argument("--coalition-size", type=int, default=2)
+    pl.add_argument("--include-adversary", action="store_true", default=True)
+    pl.add_argument("--no-adversary", dest="include_adversary", action="store_false")
+    pl.add_argument("--drop-rate", type=float, default=0.0)
+    pl.add_argument("--dup-rate", type=float, default=0.0)
+    # trace policy for baseline compare only (sensitivity is metrics-only)
+    pl.add_argument("--trace-level", choices=["none", "audit", "full"], default="audit")
+    pl.add_argument("--audit-max-cases", type=int, default=30)
+    pl.add_argument("--audit-policy", choices=["diff", "pure_fail", "hybrid_fail", "random"], default="diff")
+    pl.add_argument("--log-every-runs", type=int, default=10)
+    pl.add_argument("--log-every-cases", type=int, default=200)
+    pl.add_argument("--max-workers", type=int, default=1)
+
+    # summarize
+    sm = sub.add_parser("summarize", help="Summarize a cases JSONL file from --trace-level full mode")
+    sm.add_argument("--jsonl", required=True)
+    sm.add_argument("--out-xlsx", default=None)
+
+    return p
+
+def main(argv: List[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.cmd == "compare":
+        run_compare(
+            outdir=args.outdir,
+            seed=args.seed,
+            warmup=args.warmup,
+            test=args.test,
+            lam=args.lam,
+            gamma=args.gamma,
+            omega=args.omega,
+            forgetting=args.forgetting,
+            coalition_size=args.coalition_size,
+            include_adversary=args.include_adversary,
+            drop_rate=args.drop_rate,
+            dup_rate=args.dup_rate,
+            scenario_overrides=args.scenario_overrides,
+            trace_level=args.trace_level,
+            audit_max_cases=args.audit_max_cases,
+            audit_policy=args.audit_policy,
+            use_sqlite=args.use_sqlite,
+            log_every_cases=args.log_every_cases,
+        )
+        print(f"Wrote: {os.path.join(args.outdir, 'run_summary.xlsx')}")
+        return 0
+
+    if args.cmd == "sensitivity":
+        run_sensitivity(
+            outdir=args.outdir,
+            regimes=args.regimes,
+            seeds=args.seeds,
+            n_samples=args.n_samples,
+            warmup=args.warmup,
+            test=args.test,
+            lam_min=args.lam_min,
+            lam_max=args.lam_max,
+            gamma_min=args.gamma_min,
+            gamma_max=args.gamma_max,
+            omega_min=args.omega_min,
+            omega_max=args.omega_max,
+            design_seed=args.design_seed,
+            forgetting=args.forgetting,
+            coalition_size=args.coalition_size,
+            include_adversary=args.include_adversary,
+            drop_rate=args.drop_rate,
+            dup_rate=args.dup_rate,
+            log_every_runs=args.log_every_runs,
+            max_workers=args.max_workers,
+        )
+        print(f"Wrote: {os.path.join(args.outdir, 'sensitivity', 'metrics.xlsx')}")
+        return 0
+
+    if args.cmd == "analyze":
+        analyze_sensitivity(args.outdir, args.regimes)
+        print(f"Wrote: {os.path.join(args.outdir, 'sensitivity', 'analysis')}")
+        return 0
+
+    if args.cmd == "pipeline":
+        run_full_pipeline(
+            outdir=args.outdir,
+            regimes=args.regimes,
+            seeds=args.seeds,
+            n_samples=args.n_samples,
+            warmup=args.warmup,
+            test=args.test,
+            lam_min=args.lam_min,
+            lam_max=args.lam_max,
+            gamma_min=args.gamma_min,
+            gamma_max=args.gamma_max,
+            omega_min=args.omega_min,
+            omega_max=args.omega_max,
+            design_seed=args.design_seed,
+            forgetting=args.forgetting,
+            coalition_size=args.coalition_size,
+            include_adversary=args.include_adversary,
+            drop_rate=args.drop_rate,
+            dup_rate=args.dup_rate,
+            trace_level=args.trace_level,
+            audit_max_cases=args.audit_max_cases,
+            audit_policy=args.audit_policy,
+            log_every_runs=args.log_every_runs,
+            log_every_cases=args.log_every_cases,
+            max_workers=args.max_workers,
+        )
+        print(f"Wrote: {os.path.join(args.outdir, 'paper_outputs')}")
+        return 0
+
+    if args.cmd == "summarize":
+        out = summarize_results(args.jsonl, out_xlsx=args.out_xlsx)
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return 0
+
+    return 1
+
+
+==================================================
+ARCHIVO: .\design.py
+==================================================
+from __future__ import annotations
+
+"""Author: Omar Portilla Jaimes
+Email: jorge.portilla2@unipamplona.edu.co
+"""
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Iterable,Optional
+import numpy as np
+
+@dataclass(frozen=True)
+class ParamBounds:
+    lam: Tuple[float, float] = (1.0, 1.8)
+    gamma: Tuple[float, float] = (0.0, 4.0)
+    omega: Tuple[float, float] = (0.0, 1.0)
+
+# cadis_sroa_rep2/design.py
+# -*- coding: utf-8 -*-
+"""
+Diseños experimentales (Latin Hypercube) para la fase de sensibilidad.
+
+Esta versión es compatible con pipeline.run_sensitivity, que llama:
+
+    latin_hypercube(n_samples, 3, seed=design_seed)
+
+Es decir, el segundo argumento es el número de dimensiones (n_dims),
+y el escalado a [lam_min, lam_max], [gamma_min, gamma_max],
+[omega_min, omega_max] se hace dentro de pipeline.py.
+"""
+
+def latin_hypercube(n_samples: int, n_dims: int, seed: Optional[int] = None) -> np.ndarray:
+    """
+    Genera un diseño Latin Hypercube en el hipercubo [0, 1]^n_dims.
+    Devuelve matriz shape (n_samples, n_dims).
+    """
+    rng = np.random.default_rng(seed)
+
+    cut = np.linspace(0.0, 1.0, n_samples + 1)
+
+    u = rng.random((n_samples, n_dims))   # (n_samples, n_dims)
+    a = cut[:-1]                          # (n_samples,)
+    b = cut[1:]                           # (n_samples,)
+
+    # FIX: expandimos a y (b-a) a (n_samples,1) para broadcasting correcto
+    rdpoints = a[:, None] + (b - a)[:, None] * u  # (n_samples, n_dims)
+
+    H = np.zeros_like(rdpoints)
+    for j in range(n_dims):
+        order = rng.permutation(n_samples)
+        H[:, j] = rdpoints[order, j]
+
+    return H
+
+
+def pareto_front(rows: Iterable[Dict], objectives: List[Tuple[str, str]]) -> List[Dict]:
+    """Return non-dominated set (Pareto front).
+
+    objectives: list of (metric_key, direction) where direction is 'max' or 'min'
+    """
+    rows = list(rows)
+    if not rows:
+        return []
+    # normalize direction: convert to maximization
+    def score(r, key, direction):
+        v = r.get(key)
+        if v is None:
+            return None
+        return v if direction == "max" else -v
+
+    front = []
+    for i, a in enumerate(rows):
+        dominated = False
+        for j, b in enumerate(rows):
+            if i == j:
+                continue
+            better_or_equal = True
+            strictly_better = False
+            for key, direction in objectives:
+                sa = score(a, key, direction)
+                sb = score(b, key, direction)
+                if sa is None or sb is None:
+                    better_or_equal = False
+                    break
+                if sb < sa:
+                    better_or_equal = False
+                    break
+                if sb > sa:
+                    strictly_better = True
+            if better_or_equal and strictly_better:
+                dominated = True
+                break
+        if not dominated:
+            front.append(a)
+    return front
+
+
+==================================================
+ARCHIVO: .\excelio.py
+==================================================
+from __future__ import annotations
+
+"""
+Author: Omar Portilla Jaimes
+Email: jorge.portilla2@unipamplona.edu.co
+"""
+
+from typing import Any, Dict, Iterable, List, Sequence, Tuple, Optional
+import json
+from pathlib import Path
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.worksheet import Worksheet
+
+
+def to_excel_value(v: Any) -> Any:
+    """Convert Python objects to Excel-safe values (openpyxl-compatible)."""
+    if v is None:
+        return None
+    if isinstance(v, (str, int, float, bool)):
+        return v
+    if isinstance(v, Path):
+        return str(v)
+    if isinstance(v, (dict, list, tuple, set)):
+        return json.dumps(v, ensure_ascii=False, sort_keys=True)
+    if hasattr(v, "item") and callable(getattr(v, "item")):
+        try:
+            return v.item()
+        except Exception:
+            pass
+    return str(v)
+
+def _autosize(ws: Worksheet, max_width: int = 60) -> None:
+    widths: Dict[int, int] = {}
+    for row in ws.iter_rows(values_only=True):
+        for j, v in enumerate(row, start=1):
+            if v is None:
+                continue
+            s = str(v)
+            widths[j] = min(max_width, max(widths.get(j, 0), len(s) + 2))
+    for j, w in widths.items():
+        ws.column_dimensions[get_column_letter(j)].width = w
+
+def write_kv_sheet(ws: Worksheet, items: Sequence[Tuple[str, Any]]) -> None:
+    ws.append(["key", "value"])
+    for k, v in items:
+        ws.append([to_excel_value(k), to_excel_value(v)])
+    _autosize(ws)
+
+def write_table_sheet(ws: Worksheet, columns: Sequence[str], rows: Iterable[Sequence[Any]]) -> None:
+    ws.append([to_excel_value(c) for c in columns])
+    for r in rows:
+        ws.append([to_excel_value(x) for x in r])
+    _autosize(ws)
+
+def write_dict_rows_sheet(ws: Worksheet, rows: List[Dict[str, Any]], columns: Optional[List[str]] = None) -> None:
+    if not rows:
+        # Write an empty sheet with headers if provided
+        cols = columns or []
+        ws.append([to_excel_value(c) for c in cols])
+        _autosize(ws)
+        return
+
+    cols = columns
+    if cols is None:
+        # Stable order for reproducibility
+        keyset = set()
+        for r in rows:
+            keyset.update(r.keys())
+        cols = sorted(keyset)
+
+    ws.append([to_excel_value(c) for c in cols])
+    for row in rows:
+        ws.append([to_excel_value(row.get(c, None)) for c in cols])
+    _autosize(ws)
+
+def save_workbook(path: str, sheets: Dict[str, Dict[str, Any]]) -> str:
+    """Create an .xlsx file with named sheets.
+
+    sheets[sheet_name] must include one of:
+      - {'type': 'kv', 'items': [(k,v), ...]}
+      - {'type': 'table', 'columns': [...], 'rows': [[...], ...]}
+      - {'type': 'dict_rows', 'rows': [dict,...], 'columns': [...] (optional)}
+    """
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    wb = Workbook()
+    # remove default sheet
+    wb.remove(wb.active)
+    for name, spec in sheets.items():
+        ws = wb.create_sheet(title=name[:31])
+        t = spec.get("type")
+        if t == "kv":
+            write_kv_sheet(ws, spec.get("items", []))
+        elif t == "table":
+            write_table_sheet(ws, spec.get("columns", []), spec.get("rows", []))
+        elif t == "dict_rows":
+            write_dict_rows_sheet(ws, spec.get("rows", []), spec.get("columns"))
+        else:
+            raise ValueError(f"Unknown sheet type: {t}")
+    wb.save(path)
+    return path
+
+
+==================================================
+ARCHIVO: .\metrics.py
+==================================================
+from __future__ import annotations
+
+"""Author: Omar Portilla Jaimes
+Email: jorge.portilla2@unipamplona.edu.co
+"""
+
+from typing import Dict, List, Tuple, Any
+import math
+
+def accuracy(y_true: List[str], y_pred: List[str]) -> float:
+    return sum(1 for a, b in zip(y_true, y_pred) if a == b) / max(1, len(y_true))
+
+def macro_f1(y_true: List[str], y_pred: List[str]) -> float:
+    labels = sorted(set(y_true) | set(y_pred))
+    f1s = []
+    for lab in labels:
+        tp = sum(1 for yt, yp in zip(y_true, y_pred) if yt == lab and yp == lab)
+        fp = sum(1 for yt, yp in zip(y_true, y_pred) if yt != lab and yp == lab)
+        fn = sum(1 for yt, yp in zip(y_true, y_pred) if yt == lab and yp != lab)
+        if tp == 0 and (fp + fn) == 0:
+            f1 = 1.0
+        elif tp == 0:
+            f1 = 0.0
+        else:
+            prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+        f1s.append(f1)
+    return sum(f1s) / len(f1s) if f1s else 0.0
+
+def wilson_ci(k: int, n: int, z: float = 1.959963984540054) -> Tuple[float, float]:
+    if n <= 0:
+        return (0.0, 1.0)
+    phat = k / n
+    denom = 1 + z * z / n
+    center = (phat + z * z / (2 * n)) / denom
+    half = z * math.sqrt((phat * (1 - phat) + z * z / (4 * n)) / n) / denom
+    return center - half, center + half
+
+def mcnemar_exact(pairs: List[Tuple[bool, bool]]) -> Dict[str, Any]:
+    b = c = 0
+    for a_ok, b_ok in pairs:
+        if a_ok and not b_ok:
+            b += 1
+        if (not a_ok) and b_ok:
+            c += 1
+    n = b + c
+    if n == 0:
+        return {"b": 0, "c": 0, "p": 1.0}
+    k = min(b, c)
+    from math import comb
+    p = sum(comb(n, i) * (0.5 ** n) for i in range(0, k + 1))
+    p = min(1.0, 2 * p)
+    return {"b": b, "c": c, "p": p}
+
+
+==================================================
+ARCHIVO: .\pipeline.py
+==================================================
+from __future__ import annotations
+
+"""Author: Omar Portilla Jaimes
+Email: jorge.portilla2@unipamplona.edu.co
+"""
+
+from typing import Any, Dict, List, Tuple, Optional
+import os
+import math
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+import numpy as np
+
+from .design import latin_hypercube, pareto_front
+from .simulation import run_compare, run_compare_metrics_only
+from .utils import write_json, sha256_text, stable_json, fingerprint_source, compute_checksums
+from .excelio import save_workbook
+
+# -------------------------
+# Internal helpers
+# -------------------------
+
+def _ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+def _write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
+    import csv
+    _ensure_dir(os.path.dirname(path))
+    if not rows:
+        return
+    cols = list(rows[0].keys())
+    extra = sorted({k for r in rows for k in r.keys()} - set(cols))
+    cols = cols + extra
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+def _write_design(outdir: str, design_rows: List[Dict[str, Any]]) -> Tuple[str, str]:
+    design_csv = os.path.join(outdir, "design.csv")
+    _write_csv(design_csv, design_rows)
+    design_xlsx = os.path.join(outdir, "design.xlsx")
+    save_workbook(design_xlsx, {"design": {"type": "dict_rows", "rows": design_rows}})
+    return design_csv, design_xlsx
+
+def _write_metrics(outdir: str, metrics_rows: List[Dict[str, Any]]) -> Tuple[str, str]:
+    metrics_csv = os.path.join(outdir, "metrics.csv")
+    _write_csv(metrics_csv, metrics_rows)
+    metrics_xlsx = os.path.join(outdir, "metrics.xlsx")
+    save_workbook(metrics_xlsx, {"metrics": {"type": "dict_rows", "rows": metrics_rows}})
+    return metrics_csv, metrics_xlsx
+
+def _code_fingerprint() -> str:
+    here = os.path.dirname(__file__)
+    sources = [os.path.join(here, f) for f in [
+        "cli.py","pipeline.py","simulation.py","sroa.py","argumentation.py","agents.py","reputation.py","metrics.py","protocol.py","design.py","utils.py","excelio.py"
+    ]]
+    return fingerprint_source(sources)
+
+# -------------------------
+# Sensitivity analysis math
+# -------------------------
+
+def _rank(x: np.ndarray) -> np.ndarray:
+    # average ranks for ties
+    temp = x.argsort()
+    ranks = np.empty_like(temp, dtype=float)
+    ranks[temp] = np.arange(len(x), dtype=float)
+    # tie handling
+    _, inv, counts = np.unique(x, return_inverse=True, return_counts=True)
+    for c in np.where(counts > 1)[0]:
+        idx = np.where(inv == c)[0]
+        ranks[idx] = ranks[idx].mean()
+    return ranks
+
+def _partial_corr(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> float:
+    # residualize x and y w.r.t z then correlate
+    # add intercept
+    Z = np.column_stack([np.ones(len(z)), z])
+    beta_x, *_ = np.linalg.lstsq(Z, x, rcond=None)
+    beta_y, *_ = np.linalg.lstsq(Z, y, rcond=None)
+    rx = x - Z @ beta_x
+    ry = y - Z @ beta_y
+    denom = (np.std(rx) * np.std(ry))
+    if denom == 0:
+        return float("nan")
+    return float(np.corrcoef(rx, ry)[0, 1])
+
+def compute_prcc(params: np.ndarray, y: np.ndarray, param_names: List[str]) -> Dict[str, float]:
+    """PRCC on rank-transformed variables."""
+    prcc: Dict[str, float] = {}
+    # rank transform
+    P = np.column_stack([_rank(params[:, i]) for i in range(params.shape[1])])
+    yy = _rank(y)
+    for i, name in enumerate(param_names):
+        others = np.delete(P, i, axis=1)
+        prcc[name] = _partial_corr(P[:, i], yy, others)
+    return prcc
+
+# -------------------------
+# Pipeline steps
+# -------------------------
+
+def run_sensitivity(
+    outdir: str,
+    regimes: List[str],
+    seeds: List[int],
+    n_samples: int,
+    warmup: int,
+    test: int,
+    lam_min: float,
+    lam_max: float,
+    gamma_min: float,
+    gamma_max: float,
+    omega_min: float,
+    omega_max: float,
+    design_seed: int,
+    forgetting: float,
+    coalition_size: int,
+    include_adversary: bool,
+    drop_rate: float,
+    dup_rate: float,
+    log_every_runs: int = 10,
+    log_every_cases: int = 0,
+    max_workers: int = 1,
+) -> Dict[str, Any]:
+    """Run LHS sensitivity across (lam,gamma,omega) for each regime and seed.
+
+    v5: avoids per-run SQLite/JSONL. Produces:
+      sensitivity/design.(csv,xlsx)
+      sensitivity/metrics.(csv,xlsx)
+      sensitivity/runs/*.json (config + checksums per run)
+    """
+    sens_dir = os.path.join(outdir, "sensitivity")
+    _ensure_dir(sens_dir)
+    runs_dir = os.path.join(sens_dir, "runs")
+    _ensure_dir(runs_dir)
+
+    # LHS in [0,1]^3
+    lhs = latin_hypercube(n_samples, 3, seed=design_seed)
+    design_rows: List[Dict[str, Any]] = []
+    samples: List[Tuple[int, float, float, float]] = []
+    for i in range(n_samples):
+        lam = lam_min + (lam_max - lam_min) * float(lhs[i, 0])
+        gam = gamma_min + (gamma_max - gamma_min) * float(lhs[i, 1])
+        omg = omega_min + (omega_max - omega_min) * float(lhs[i, 2])
+        samples.append((i, lam, gam, omg))
+        design_rows.append({"sample_id": i, "lam": lam, "gamma": gam, "omega": omg})
+
+    design_csv, design_xlsx = _write_design(sens_dir, design_rows)
+
+    code_fp = _code_fingerprint()
+
+    # Build jobs
+    jobs: List[Dict[str, Any]] = []
+    for reg in regimes:
+        for (sid, lam, gam, omg) in samples:
+            for seed in seeds:
+                jobs.append({
+                    "regime": reg,
+                    "sample_id": sid,
+                    "seed": seed,
+                    "lam": lam,
+                    "gamma": gam,
+                    "omega": omg,
+                })
+
+    def _job_worker(job: Dict[str, Any]) -> Dict[str, Any]:
+        # regime affects scenario overrides (kept stable with v4 naming)
+        scenario_overrides = _regime_overrides(job["regime"])
+        res = run_compare_metrics_only(
+            seed=int(job["seed"]),
+            warmup=warmup,
+            test=test,
+            lam=float(job["lam"]),
+            gamma=float(job["gamma"]),
+            omega=float(job["omega"]),
+            forgetting=forgetting,
+            coalition_size=coalition_size,
+            include_adversary=include_adversary,
+            drop_rate=drop_rate,
+            dup_rate=dup_rate,
+            scenario_overrides=scenario_overrides,
+            audit_max_cases=0,  # sensitivity: no per-run audit by default
+            audit_policy="diff",
+            log_every_cases=log_every_cases,
+        )
+        row = {
+            "regime": job["regime"],
+            "sample_id": int(job["sample_id"]),
+            "seed": int(job["seed"]),
+            "lam": float(job["lam"]),
+            "gamma": float(job["gamma"]),
+            "omega": float(job["omega"]),
+            "forgetting": float(forgetting),
+            "eta_equivalent": float(1.0 - forgetting),
+            "drop_rate": float(drop_rate),
+            "dup_rate": float(dup_rate),
+            # metrics
+            "pure_accuracy": float(res["pure_accuracy"]),
+            "hybrid_accuracy": float(res["hybrid_accuracy"]),
+            "pure_macro_f1": float(res["pure_macro_f1"]),
+            "hybrid_macro_f1": float(res["hybrid_macro_f1"]),
+            "paired_pure_correct_only": int(res["paired_pure_correct_only"]),
+            "paired_hybrid_correct_only": int(res["paired_hybrid_correct_only"]),
+            "paired_both_correct": int(res["paired_both_correct"]),
+            "paired_both_wrong": int(res["paired_both_wrong"]),
+            "avg_message_count": float(res["avg_message_count"]),
+            "avg_attacks_total": float(res["avg_attacks_total"]),
+            "avg_filtered_attacks": float(res["avg_filtered_attacks"]),
+            "avg_defeats_total": float(res["avg_defeats_total"]),
+            "filter_ratio_mean": float(res["filter_ratio_mean"]),
+            "EPR_sroa_hybrid": None if res["EPR_sroa_hybrid"] is None else float(res["EPR_sroa_hybrid"]),
+            "CCR_sroa_hybrid": None if res["CCR_sroa_hybrid"] is None else float(res["CCR_sroa_hybrid"]),
+            "rad_mean": float(res["rad_mean"]),
+            "rad_p50": float(res["rad_p50"]),
+            "rad_p95": float(res["rad_p95"]),
+        }
+        # write per-run config + checksums (small, auditable)
+        run_id = f"{job['regime']}_s{int(job['sample_id']):04d}_seed{int(job['seed'])}"
+        cfg = {
+            "author": "Omar Portilla Jaimes",
+            "email": "jorge.portilla2@unipamplona.edu.co",
+            "run_id": run_id,
+            "regime": job["regime"],
+            "seed": int(job["seed"]),
+            "warmup": warmup,
+            "test": test,
+            "lam": float(job["lam"]),
+            "gamma": float(job["gamma"]),
+            "omega": float(job["omega"]),
+            "forgetting_rate": float(forgetting),
+            "eta_equivalent": float(1.0 - forgetting),
+            "coalition_size": int(coalition_size),
+            "include_adversary": bool(include_adversary),
+            "drop_rate": float(drop_rate),
+            "dup_rate": float(dup_rate),
+            "scenario_overrides": scenario_overrides,
+        }
+        cfg_fp = sha256_text(stable_json(cfg))
+        cfg_out = os.path.join(runs_dir, f"{run_id}_config.json")
+        write_json(cfg_out, {**cfg, "code_fingerprint": code_fp, "config_fingerprint": cfg_fp})
+        chk_out = os.path.join(runs_dir, f"{run_id}_checksums.json")
+        checks = compute_checksums([cfg_out], root=runs_dir)
+        write_json(chk_out, checks)
+        return row
+
+    metrics_rows: List[Dict[str, Any]] = []
+    total = len(jobs)
+
+    if max_workers and max_workers > 1:
+        # Windows-safe: spawn mode by default; functions are top-level.
+        with ProcessPoolExecutor(max_workers=max_workers) as ex:
+            futs = {ex.submit(_job_worker, job): job for job in jobs}
+            done = 0
+            for fut in as_completed(futs):
+                metrics_rows.append(fut.result())
+                done += 1
+                if log_every_runs and (done % log_every_runs == 0 or done == total):
+                    print(f"[sensitivity] {done}/{total} runs")
+    else:
+        for j, job in enumerate(jobs, start=1):
+            metrics_rows.append(_job_worker(job))
+            if log_every_runs and (j % log_every_runs == 0 or j == total):
+                print(f"[sensitivity] {j}/{total} runs")
+
+    metrics_csv, metrics_xlsx = _write_metrics(sens_dir, metrics_rows)
+
+    return {
+        "sensitivity_dir": sens_dir,
+        "design_csv": design_csv,
+        "design_xlsx": design_xlsx,
+        "metrics_csv": metrics_csv,
+        "metrics_xlsx": metrics_xlsx,
+        "n_runs": total,
+    }
+
+def analyze_sensitivity(outdir: str, regimes: List[str]) -> Dict[str, Any]:
+    """Compute PRCC + Pareto front per regime and write Excel/CSV outputs."""
+    sens_dir = os.path.join(outdir, "sensitivity")
+    metrics_csv = os.path.join(sens_dir, "metrics.csv")
+    if not os.path.exists(metrics_csv):
+        raise FileNotFoundError(f"Missing {metrics_csv}. Run sensitivity first.")
+
+    import csv
+    rows: List[Dict[str, Any]] = []
+    with open(metrics_csv, encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            rows.append(row)
+
+    results: Dict[str, Any] = {"per_regime": {}}
+    param_names = ["lam", "gamma", "omega"]
+
+    for reg in regimes:
+        reg_rows = [rr for rr in rows if rr.get("regime") == reg]
+        if not reg_rows:
+            continue
+
+        # arrays
+        P = np.array([[float(rr[p]) for p in param_names] for rr in reg_rows], dtype=float)
+
+        metrics_of_interest = [
+            ("hybrid_accuracy", "max"),
+            ("CCR_sroa_hybrid", "max"),
+            ("rad_mean", "min"),
+        ]
+
+        prcc_table: List[Dict[str, Any]] = []
+        spearman_table: List[Dict[str, Any]] = []
+
+        for metric, _dir in metrics_of_interest:
+            y = np.array([float(rr[metric]) if rr[metric] not in (None, "", "None") else float("nan") for rr in reg_rows], dtype=float)
+            # drop NaNs
+            mask = ~np.isnan(y)
+            Pm = P[mask]
+            ym = y[mask]
+            if len(ym) < 5:
+                continue
+            pr = compute_prcc(Pm, ym, param_names)
+            # Spearman (rank correlation)
+            yy = _rank(ym)
+            for i, pname in enumerate(param_names):
+                xi = _rank(Pm[:, i])
+                rho = float(np.corrcoef(xi, yy)[0, 1]) if (np.std(xi) * np.std(yy)) != 0 else float("nan")
+                spearman_table.append({"metric": metric, "param": pname, "spearman_rho": rho})
+                prcc_table.append({"metric": metric, "param": pname, "prcc": pr[pname]})
+
+        # Pareto front (needs float rows)
+        flat_rows: List[Dict[str, Any]] = []
+        for rr in reg_rows:
+            flat_rows.append({
+                "regime": reg,
+                "sample_id": int(rr["sample_id"]),
+                "seed": int(rr["seed"]),
+                "lam": float(rr["lam"]),
+                "gamma": float(rr["gamma"]),
+                "omega": float(rr["omega"]),
+                "hybrid_accuracy": float(rr["hybrid_accuracy"]),
+                "CCR_sroa_hybrid": float(rr["CCR_sroa_hybrid"]) if rr["CCR_sroa_hybrid"] not in (None, "", "None") else float("nan"),
+                "rad_mean": float(rr["rad_mean"]),
+                "avg_defeats_total": float(rr["avg_defeats_total"]),
+            })
+        # Some regimes could yield nan CCR; pareto_front expects finite
+        flat_rows2 = [r for r in flat_rows if not (math.isnan(r["CCR_sroa_hybrid"]) or math.isnan(r["hybrid_accuracy"]) or math.isnan(r["rad_mean"]))]
+        front = pareto_front(flat_rows2, objectives=[("hybrid_accuracy", "max"), ("CCR_sroa_hybrid", "max"), ("rad_mean", "min")])
+
+        out_reg = os.path.join(sens_dir, "analysis", reg)
+        _ensure_dir(out_reg)
+
+        # Save CSV for compatibility
+        _write_csv(os.path.join(out_reg, "pareto_front.csv"), front)
+
+        # Save XLSX (required)
+        prcc_xlsx = os.path.join(out_reg, "prcc.xlsx")
+        save_workbook(prcc_xlsx, {
+            "prcc": {"type": "dict_rows", "rows": prcc_table},
+            "spearman": {"type": "dict_rows", "rows": spearman_table},
+        })
+        pareto_xlsx = os.path.join(out_reg, "pareto_front.xlsx")
+        save_workbook(pareto_xlsx, {"pareto_front": {"type": "dict_rows", "rows": front}})
+
+        results["per_regime"][reg] = {
+            "prcc_xlsx": prcc_xlsx,
+            "pareto_xlsx": pareto_xlsx,
+            "pareto_csv": os.path.join(out_reg, "pareto_front.csv"),
+        }
+
+    return results
+
+def _regime_overrides(regime: str) -> Dict[str, Any]:
+    """Map regime id to scenario overrides (kept aligned with previous prototype semantics)."""
+    if regime == "R0_default":
+        return {}
+    if regime == "R1_expert_degraded":
+        return {"expert_accuracy": 0.75}
+    if regime == "R2_more_noise":
+        return {"noisy_accuracy": 0.45, "noisy_attack_rate": 0.85}
+    if regime == "R3_more_adversarial":
+        return {"adversary_accuracy": 0.30, "adversary_attack_rate": 0.95}
+    # fallback: no override
+    return {}
+
+def run_full_pipeline(
+    outdir: str,
+    regimes: List[str],
+    seeds: List[int],
+    n_samples: int,
+    warmup: int,
+    test: int,
+    lam_min: float,
+    lam_max: float,
+    gamma_min: float,
+    gamma_max: float,
+    omega_min: float,
+    omega_max: float,
+    design_seed: int,
+    forgetting: float,
+    coalition_size: int,
+    include_adversary: bool,
+    drop_rate: float,
+    dup_rate: float,
+    trace_level: str,
+    audit_max_cases: int,
+    audit_policy: str,
+    log_every_runs: int = 10,
+    log_every_cases: int = 200,
+    max_workers: int = 1,
+) -> Dict[str, Any]:
+    """End-to-end pipeline: baseline compare + sensitivity + analysis + paper_outputs."""
+    _ensure_dir(outdir)
+
+    # Baseline compare (one run) for paper narrative (fast + auditable)
+    baseline_dir = os.path.join(outdir, "baseline")
+    _ensure_dir(baseline_dir)
+    baseline = run_compare(
+        outdir=os.path.join(baseline_dir, "compare_R0_default"),
+        seed=seeds[0] if seeds else 7,
+        warmup=warmup,
+        test=test,
+        lam=(lam_min + lam_max) / 2.0,
+        gamma=(gamma_min + gamma_max) / 2.0,
+        omega=(omega_min + omega_max) / 2.0,
+        forgetting=forgetting,
+        coalition_size=coalition_size,
+        include_adversary=include_adversary,
+        drop_rate=drop_rate,
+        dup_rate=dup_rate,
+        scenario_overrides=_regime_overrides("R0_default"),
+        trace_level=trace_level,
+        audit_max_cases=audit_max_cases,
+        audit_policy=audit_policy,
+        use_sqlite=False,
+        log_every_cases=log_every_cases,
+    )
+
+    # Sensitivity
+    sens = run_sensitivity(
+        outdir=outdir,
+        regimes=regimes,
+        seeds=seeds,
+        n_samples=n_samples,
+        warmup=warmup,
+        test=test,
+        lam_min=lam_min,
+        lam_max=lam_max,
+        gamma_min=gamma_min,
+        gamma_max=gamma_max,
+        omega_min=omega_min,
+        omega_max=omega_max,
+        design_seed=design_seed,
+        forgetting=forgetting,
+        coalition_size=coalition_size,
+        include_adversary=include_adversary,
+        drop_rate=drop_rate,
+        dup_rate=dup_rate,
+        log_every_runs=log_every_runs,
+        log_every_cases=0,  # keep sensitivity quiet by default
+        max_workers=max_workers,
+    )
+
+    # Analysis
+    analysis = analyze_sensitivity(outdir, regimes)
+
+    # Paper outputs (consolidated)
+    paper = create_paper_outputs(outdir, regimes, baseline)
+
+    return {"baseline": baseline, "sensitivity": sens, "analysis": analysis, "paper_outputs": paper}
+
+def create_paper_outputs(outdir: str, regimes: List[str], baseline: Dict[str, Any]) -> Dict[str, str]:
+    paper_dir = os.path.join(outdir, "paper_outputs")
+    _ensure_dir(paper_dir)
+
+    # paper_metrics.xlsx: repack baseline run_summary.xlsx (stable sheets)
+    bm = baseline.get("method_metrics", [])
+    bc = baseline.get("case_aggregate", [])
+    # audit cases are stored only when trace_level==audit; read from JSONL if exists
+    audit_cases: List[Dict[str, Any]] = []
+    audit_jsonl = os.path.join(baseline["outdir"], "audit_cases.jsonl")
+    if os.path.exists(audit_jsonl):
+        import json
+        with open(audit_jsonl, encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    audit_cases.append(json.loads(line))
+    paper_metrics = os.path.join(paper_dir, "paper_metrics.xlsx")
+    save_workbook(paper_metrics, {
+        "baseline_method_metrics": {"type": "dict_rows", "rows": bm},
+        "baseline_case_aggregate": {"type": "dict_rows", "rows": bc},
+        "baseline_audit_cases": {"type": "dict_rows", "rows": audit_cases},
+    })
+
+    # paper_sensitivity.xlsx: copy metrics.xlsx content (read CSV and write)
+    sens_metrics_csv = os.path.join(outdir, "sensitivity", "metrics.csv")
+    import csv
+    rows: List[Dict[str, Any]] = []
+    with open(sens_metrics_csv, encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            rows.append(row)
+    paper_sens = os.path.join(paper_dir, "paper_sensitivity.xlsx")
+    save_workbook(paper_sens, {"metrics": {"type": "dict_rows", "rows": rows}})
+
+    # paper_prcc.xlsx and paper_pareto.xlsx: merge per regime
+    prcc_sheets: Dict[str, Dict[str, Any]] = {}
+    pareto_sheets: Dict[str, Dict[str, Any]] = {}
+
+    for reg in regimes:
+        prcc_path = os.path.join(outdir, "sensitivity", "analysis", reg, "prcc.xlsx")
+        pareto_path = os.path.join(outdir, "sensitivity", "analysis", reg, "pareto_front.xlsx")
+        # We avoid reading existing xlsx; instead, re-load CSV/JSON tables from standard outputs already present.
+        # Here we rebuild from CSV files we wrote.
+        pareto_csv = os.path.join(outdir, "sensitivity", "analysis", reg, "pareto_front.csv")
+        pareto_rows: List[Dict[str, Any]] = []
+        if os.path.exists(pareto_csv):
+            with open(pareto_csv, encoding="utf-8") as f:
+                r = csv.DictReader(f)
+                for row in r:
+                    pareto_rows.append(row)
+        # PRCC tables: we stored inside xlsx only. Recompute quickly from metrics.csv for that regime:
+        # (small overhead; improves portability)
+        reg_rows = [rr for rr in rows if rr.get("regime") == reg]
+        if reg_rows:
+            P = np.array([[float(rr[p]) for p in ["lam","gamma","omega"]] for rr in reg_rows], dtype=float)
+            metrics_of_interest = ["hybrid_accuracy", "CCR_sroa_hybrid", "rad_mean"]
+            prcc_rows: List[Dict[str, Any]] = []
+            for metric in metrics_of_interest:
+                y = np.array([float(rr[metric]) if rr[metric] not in ("", None, "None") else float("nan") for rr in reg_rows], dtype=float)
+                mask = ~np.isnan(y)
+                if mask.sum() < 5:
+                    continue
+                pr = compute_prcc(P[mask], y[mask], ["lam","gamma","omega"])
+                for pname, val in pr.items():
+                    prcc_rows.append({"metric": metric, "param": pname, "prcc": val})
+            prcc_sheets[f"prcc_{reg}"] = {"type": "dict_rows", "rows": prcc_rows}
+        pareto_sheets[f"pareto_{reg}"] = {"type": "dict_rows", "rows": pareto_rows}
+
+    paper_prcc = os.path.join(paper_dir, "paper_prcc.xlsx")
+    save_workbook(paper_prcc, prcc_sheets or {"prcc": {"type": "kv", "items": [("note","no data") ]}})
+    paper_pareto = os.path.join(paper_dir, "paper_pareto.xlsx")
+    save_workbook(paper_pareto, pareto_sheets or {"pareto": {"type": "kv", "items": [("note","no data")]}})
+
+    return {
+        "paper_dir": paper_dir,
+        "paper_metrics_xlsx": paper_metrics,
+        "paper_sensitivity_xlsx": paper_sens,
+        "paper_prcc_xlsx": paper_prcc,
+        "paper_pareto_xlsx": paper_pareto,
+    }
+
+
+==================================================
+ARCHIVO: .\protocol.py
+==================================================
+from __future__ import annotations
+
+"""
+Author: Omar Portilla Jaimes
+Email: jorge.portilla2@unipamplona.edu.co
+
+Protocol / persistence utilities.
+
+v5 design goal:
+- Default: no per-event persistence (fast, small outputs).
+- Reproducibility is guaranteed via config + code fingerprints + checksums.
+- Optional qualitative audit: store a small subset of per-case records (JSONL).
+- Optional full tracing: per-case JSONL; SQLite only if explicitly requested.
+"""
+
+from dataclasses import dataclass, asdict
+from typing import Any, Dict, Optional
+from pathlib import Path
+import datetime
+import hashlib
+import json
+import sqlite3
+import uuid
+
+def utc_now_iso() -> str:
+    return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+def stable_json(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+def sha256_hex(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+class BaseStore:
+    """Abstract persistence interface.
+
+    This is intentionally minimal: the simulation may optionally emit *case-level*
+    records for audit or full tracing, but per-event storage is disabled by default.
+    """
+    def record_case(self, record: Dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        return
+
+class NullStore(BaseStore):
+    def record_case(self, record: Dict[str, Any]) -> None:
+        return
+
+class JsonlCaseStore(BaseStore):
+    """Append-only JSONL store for case-level records."""
+    def __init__(self, path: str):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self._fh = open(path, "a", encoding="utf-8")
+
+    def record_case(self, record: Dict[str, Any]) -> None:
+        self._fh.write(stable_json(record) + "\n")
+
+    def close(self) -> None:
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+
+class SqliteStore(BaseStore):
+    """Optional per-event store with tamper-evident hash chain (legacy).
+
+    Disabled by default. Only enable if:
+      --trace-level full --use-sqlite
+    """
+
+    def __init__(self, db_path: str):
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self.db_path = db_path
+        self._con = sqlite3.connect(db_path)
+        self._con.execute(
+            """CREATE TABLE IF NOT EXISTS events (
+                event_id TEXT PRIMARY KEY,
+                consultation_id TEXT,
+                logical_clock INTEGER,
+                payload_json TEXT,
+                prev_hash TEXT,
+                this_hash TEXT,
+                timestamp_utc TEXT
+            )"""
+        )
+        self._con.commit()
+        self._last_hash_by_cons: Dict[str, str] = {}
+
+    def append_event(self, consultation_id: str, logical_clock: int, payload: Dict[str, Any]) -> None:
+        eid = str(uuid.uuid4())
+        payload_json = stable_json(payload)
+        prev = self._last_hash_by_cons.get(consultation_id, "")
+        this_hash = sha256_hex(prev + payload_json)
+        self._con.execute(
+            "INSERT INTO events VALUES (?,?,?,?,?,?,?)",
+            (eid, consultation_id, logical_clock, payload_json, prev, this_hash, utc_now_iso()),
+        )
+        self._last_hash_by_cons[consultation_id] = this_hash
+
+    def record_case(self, record: Dict[str, Any]) -> None:
+        # For sqlite mode, we still allow storing a summary per case if desired.
+        # Kept as no-op here to avoid schema changes.
+        return
+
+    def close(self) -> None:
+        try:
+            self._con.commit()
+            self._con.close()
+        except Exception:
+            pass
+
+
+==================================================
+ARCHIVO: .\reputation.py
+==================================================
+from __future__ import annotations
+
+"""Author: Omar Portilla Jaimes
+Email: jorge.portilla2@unipamplona.edu.co
+"""
+
+from dataclasses import dataclass
+from typing import Dict, Tuple, List
+import numpy as np
+
+@dataclass
+class BetaRep:
+    alpha: float = 1.0
+    beta: float = 1.0
+
+    def mean(self) -> float:
+        return float(self.alpha / (self.alpha + self.beta))
+
+    def update(self, success: bool, forgetting: float = 0.0) -> None:
+        f = float(forgetting)
+        f = 0.0 if f < 0.0 else (0.99 if f > 0.99 else f)
+        self.alpha = (1.0 - f) * self.alpha
+        self.beta = (1.0 - f) * self.beta
+        if success:
+            self.alpha += 1.0
+        else:
+            self.beta += 1.0
+
+def katz_centrality(num_nodes: int, edges: List[Tuple[int, int]], alpha: float = 0.1, beta: float = 1.0, iters: int = 50) -> np.ndarray:
+    A = np.zeros((num_nodes, num_nodes), dtype=float)
+    for u, v in edges:
+        if 0 <= u < num_nodes and 0 <= v < num_nodes:
+            A[v, u] += 1.0  # transpose convention
+    x = np.ones((num_nodes,), dtype=float)
+    for _ in range(iters):
+        x = alpha * (A @ x) + beta * np.ones_like(x)
+    mn, mx = float(x.min()), float(x.max())
+    if mx - mn < 1e-9:
+        return np.zeros_like(x)
+    return (x - mn) / (mx - mn)
+
+def fuse_reputation(hist: Dict[str, BetaRep], ctx: Dict[str, float], omega: float) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for aid, b in hist.items():
+        rh = b.mean()
+        rc = float(ctx.get(aid, 0.0))
+        r = float(omega * rh + (1.0 - omega) * rc)
+        out[aid] = 0.0 if r < 0.0 else (1.0 if r > 1.0 else r)
+    return out
+
+
+==================================================
+ARCHIVO: .\simulation.py
+==================================================
+from __future__ import annotations
+
+"""Author: Omar Portilla Jaimes
+Email: jorge.portilla2@unipamplona.edu.co
+"""
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple, Optional
+import os
+import random
+from collections import Counter, defaultdict
+
+import numpy as np
+
+from .argumentation import AF, Argument
+from .agents import SpecialistAgent
+from .metrics import wilson_ci
+from .sroa import SROA, SROAConfig
+from .protocol import BaseStore, NullStore, JsonlCaseStore, SqliteStore
+from .utils import write_json, compute_checksums, fingerprint_source, sha256_text, stable_json
+from .excelio import save_workbook
+
+HYPOTHESES = [f"H{i}" for i in range(1, 6)]
+
+@dataclass
+class Scenario:
+    """Synthetic regime specification.
+
+    The goal is not clinical realism but controlled stress-testing of orchestration
+    under heterogeneous agent reliability and coalition refutations.
+    """
+    coalition_size: int = 2
+    include_adversary: bool = True
+
+    # reliabilities (probability of proposing ground truth)
+    expert_accuracy: float = 0.90
+    noisy_accuracy: float = 0.55
+    adversary_accuracy: float = 0.40
+
+    # confidence distributions (min,max)
+    conf_correct_expert: Tuple[float, float] = (0.70, 0.95)
+    conf_wrong_expert: Tuple[float, float] = (0.45, 0.70)
+    conf_correct_noisy: Tuple[float, float] = (0.55, 0.85)
+    conf_wrong_noisy: Tuple[float, float] = (0.45, 0.80)
+    conf_correct_adv: Tuple[float, float] = (0.55, 0.90)
+    conf_wrong_adv: Tuple[float, float] = (0.55, 0.90)
+
+    # interaction behavior
+    expert_attack_rate: float = 0.20
+    noisy_attack_rate: float = 0.75
+    adversary_attack_rate: float = 0.90
+    target_expert_bias_noisy: float = 0.80
+    target_expert_bias_adv: float = 0.95
+    overconfident_rate: float = 0.50
+
+def build_agents(scn: Scenario) -> List[SpecialistAgent]:
+    agents: List[SpecialistAgent] = []
+    # Expert (A1)
+    agents.append(
+        SpecialistAgent(
+            "A1",
+            accuracy=scn.expert_accuracy,
+            conf_correct=scn.conf_correct_expert,
+            conf_wrong=scn.conf_wrong_expert,
+            attack_rate=scn.expert_attack_rate,
+            target_expert_bias=0.0,
+            overconfident=False,
+        )
+    )
+    # Noisy coalition members (A2..)
+    for i in range(2, 2 + scn.coalition_size):
+        over = random.random() < scn.overconfident_rate
+        agents.append(
+            SpecialistAgent(
+                f"A{i}",
+                accuracy=scn.noisy_accuracy,
+                conf_correct=scn.conf_correct_noisy,
+                conf_wrong=scn.conf_wrong_noisy,
+                attack_rate=scn.noisy_attack_rate,
+                target_expert_bias=scn.target_expert_bias_noisy,
+                overconfident=over,
+            )
+        )
+    # Adversary (optional)
+    if scn.include_adversary:
+        agents.append(
+            SpecialistAgent(
+                "A_adv",
+                accuracy=scn.adversary_accuracy,
+                conf_correct=scn.conf_correct_adv,
+                conf_wrong=scn.conf_wrong_adv,
+                attack_rate=scn.adversary_attack_rate,
+                target_expert_bias=scn.target_expert_bias_adv,
+                overconfident=True,
+            )
+        )
+    return agents
+
+def _macro_f1_from_cm(cm: Dict[str, Dict[str, int]], labels: List[str]) -> float:
+    # cm[true][pred] counts
+    f1s: List[float] = []
+    for lab in labels:
+        tp = cm[lab].get(lab, 0)
+        fp = sum(cm[t].get(lab, 0) for t in labels if t != lab)
+        fn = sum(cm[lab].get(p, 0) for p in labels if p != lab)
+        if tp == 0 and (fp + fn) == 0:
+            f1 = 1.0
+        elif tp == 0:
+            f1 = 0.0
+        else:
+            prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+        f1s.append(f1)
+    return float(sum(f1s) / len(f1s)) if f1s else 0.0
+
+def _reservoir_update(reservoir: List[Dict[str, Any]], item: Dict[str, Any], k: int, i: int, rng: random.Random) -> None:
+    """Reservoir sample size k from a stream. i is 1-based index."""
+    if k <= 0:
+        return
+    if len(reservoir) < k:
+        reservoir.append(item)
+        return
+    j = rng.randint(1, i)
+    if j <= k:
+        reservoir[j - 1] = item
+
+def run_compare(
+    outdir: str,
+    seed: int,
+    warmup: int,
+    test: int,
+    lam: float,
+    gamma: float,
+    omega: float,
+    forgetting: float,
+    coalition_size: int,
+    include_adversary: bool,
+    drop_rate: float = 0.0,
+    dup_rate: float = 0.0,
+    scenario_overrides: Optional[Dict[str, Any]] = None,
+    trace_level: str = "audit",
+    audit_max_cases: int = 30,
+    audit_policy: str = "diff",
+    use_sqlite: bool = False,
+    log_every_cases: int = 200,
+) -> Dict[str, Any]:
+    """Run a single warmup+test experiment.
+
+    v5 persistence:
+    - Default: only aggregated outputs + paper-ready Excel.
+    - Optional: audit subset of cases (JSONL) or full cases (JSONL).
+    - Optional: legacy sqlite event store only if explicitly requested.
+    """
+    os.makedirs(outdir, exist_ok=True)
+
+    # Deterministic seeds
+    random.seed(seed)
+    np.random.seed(seed)
+
+    # Build scenario
+    scn = Scenario(coalition_size=coalition_size, include_adversary=include_adversary)
+    if scenario_overrides:
+        for k, v in scenario_overrides.items():
+            if hasattr(scn, k):
+                setattr(scn, k, v)
+
+    # Trace stores
+    trace_level = (trace_level or "audit").lower()
+    if trace_level not in {"none", "audit", "full"}:
+        raise ValueError("trace_level must be one of: none, audit, full")
+
+    store: BaseStore = NullStore()
+    full_store: Optional[BaseStore] = None
+    sqlite_store: Optional[SqliteStore] = None
+
+    if trace_level == "audit":
+        store = JsonlCaseStore(os.path.join(outdir, "audit_cases.jsonl"))
+    elif trace_level == "full":
+        full_store = JsonlCaseStore(os.path.join(outdir, "cases_full.jsonl"))
+        if use_sqlite:
+            sqlite_store = SqliteStore(os.path.join(outdir, "event_store.sqlite"))
+
+    agent_ids = ["A1"] + [f"A{i}" for i in range(2, 2 + coalition_size)] + (["A_adv"] if include_adversary else [])
+    sroa_pure = SROA(agent_ids, SROAConfig(mode="pure", lam=lam, gamma=gamma, omega=omega, forgetting=forgetting))
+    sroa_hyb = SROA(agent_ids, SROAConfig(mode="hybrid", lam=lam, gamma=gamma, omega=omega, forgetting=forgetting))
+
+    # Aggregators
+    labels = HYPOTHESES
+    cm: Dict[str, Dict[str, Dict[str, int]]] = {m: {t: defaultdict(int) for t in labels} for m in ["pure", "hybrid", "majority", "conf_weighted", "ds_only"]}
+    correct: Dict[str, int] = {m: 0 for m in cm.keys()}
+    n_test = 0
+
+    # Paired counts pure vs hybrid
+    paired = {"pure_correct": 0, "hybrid_correct": 0, "both_correct": 0, "both_wrong": 0}
+
+    # Operational
+    msg_sum = 0
+    hyb_attacks_sum = 0
+    hyb_defeats_sum = 0
+    hyb_filtered_sum = 0
+    rad_list: List[float] = []
+
+    # Conditional metrics: expert-preservation (EPR) and coalition-correction (CCR)
+    expert_total = 0
+    nonexpert_total = 0
+    pure_correct_expert = 0
+    pure_correct_nonexpert = 0
+    hyb_correct_expert = 0
+    hyb_correct_nonexpert = 0
+
+    gt_counts = Counter()
+    pred_counts: Dict[str, Counter] = {m: Counter() for m in cm.keys()}
+
+    # Audit selection
+    audit_policy = (audit_policy or "diff").lower()
+    if audit_policy not in {"diff", "pure_fail", "hybrid_fail", "random"}:
+        raise ValueError("audit_policy must be one of: diff, pure_fail, hybrid_fail, random")
+    rng_audit = random.Random(seed ^ 0xBADC0DE)
+    selected: List[Dict[str, Any]] = []
+    reservoir_all: List[Dict[str, Any]] = []  # for padding / random policy
+    stream_i = 0
+
+    def should_select(rec: Dict[str, Any]) -> bool:
+        if audit_policy == "diff":
+            return rec["pred_pure"] != rec["pred_hybrid"]
+        if audit_policy == "pure_fail":
+            return not rec["pure_correct"]
+        if audit_policy == "hybrid_fail":
+            return not rec["hybrid_correct"]
+        return False
+
+    def add_audit_candidate(rec: Dict[str, Any], reason: str) -> None:
+        if len(selected) < audit_max_cases:
+            rec["audit_reason"] = reason
+            selected.append(rec)
+
+    # Warmup: stabilize reputation only (no traces unless full+use_sqlite)
+    for i in range(warmup):
+        _run_one_case(
+            case_idx=i,
+            phase="warmup",
+            scn=scn,
+            sroa_pure=sroa_pure,
+            sroa_hyb=sroa_hyb,
+            drop_rate=drop_rate,
+            dup_rate=dup_rate,
+            sqlite_store=sqlite_store if (trace_level == "full" and use_sqlite) else None,
+        )
+
+    # Test
+    for i in range(test):
+        case = _run_one_case(
+            case_idx=i,
+            phase="test",
+            scn=scn,
+            sroa_pure=sroa_pure,
+            sroa_hyb=sroa_hyb,
+            drop_rate=drop_rate,
+            dup_rate=dup_rate,
+            sqlite_store=sqlite_store if (trace_level == "full" and use_sqlite) else None,
+        )
+
+        n_test += 1
+        gt = case["ground_truth"]
+        gt_counts[gt] += 1
+
+        # predictions
+        for mname, pred in [
+            ("pure", case["pred_pure"]),
+            ("hybrid", case["pred_hybrid"]),
+            ("majority", case["pred_majority"]),
+            ("conf_weighted", case["pred_conf_weighted"]),
+            ("ds_only", case["pred_ds_only"]),
+        ]:
+            cm[mname][gt][pred] += 1
+            pred_counts[mname][pred] += 1
+
+        # correct
+        pure_ok = case["pure_correct"]
+        hyb_ok = case["hybrid_correct"]
+        expert_ok = bool(case["audit_row"].get("expert_correct", False))
+        if expert_ok:
+            expert_total += 1
+            if pure_ok: pure_correct_expert += 1
+            if hyb_ok: hyb_correct_expert += 1
+        else:
+            nonexpert_total += 1
+            if pure_ok: pure_correct_nonexpert += 1
+            if hyb_ok: hyb_correct_nonexpert += 1
+
+        if pure_ok:
+            correct["pure"] += 1
+        if hyb_ok:
+            correct["hybrid"] += 1
+        if case["majority_correct"]:
+            correct["majority"] += 1
+        if case["conf_weighted_correct"]:
+            correct["conf_weighted"] += 1
+        if case["ds_only_correct"]:
+            correct["ds_only"] += 1
+
+        # paired
+        if pure_ok and hyb_ok:
+            paired["both_correct"] += 1
+        elif (not pure_ok) and (not hyb_ok):
+            paired["both_wrong"] += 1
+        else:
+            if pure_ok:
+                paired["pure_correct"] += 1
+            if hyb_ok:
+                paired["hybrid_correct"] += 1
+
+        # operational
+        msg_sum += case["message_count"]
+        hyb_attacks_sum += case.get("hyb_attacks_total", 0)
+        hyb_defeats_sum += case.get("hyb_defeats_total", 0)
+        hyb_filtered_sum += case.get("hyb_filtered_attacks", 0)
+        # rad per-case
+        at = case.get("hyb_attacks_total", 0)
+        fa = case.get("hyb_filtered_attacks", 0)
+        rad_list.append((fa / at) if at else 0.0)
+
+        # audit streaming
+        stream_i += 1
+        audit_row = case["audit_row"]
+        if audit_policy == "random":
+            _reservoir_update(reservoir_all, audit_row, audit_max_cases, stream_i, rng_audit)
+        else:
+            _reservoir_update(reservoir_all, audit_row, audit_max_cases, stream_i, rng_audit)
+            if should_select(audit_row):
+                add_audit_candidate(audit_row, audit_policy)
+
+        if log_every_cases and ((i + 1) % log_every_cases == 0 or (i + 1) == test):
+            print(f"[compare] seed={seed} {i+1}/{test} cases")
+
+        # full store (case-level)
+        if trace_level == "full" and full_store is not None:
+            full_store.record_case(case["full_record"])
+
+    # finalize audit selection to exact N
+    if trace_level == "audit":
+        if audit_policy == "random":
+            selected = list(reservoir_all)[:audit_max_cases]
+        else:
+            if len(selected) < audit_max_cases:
+                # pad with reproducible random reservoir, avoiding duplicates
+                used = {(r["consultation_id"], r.get("phase", "test")) for r in selected}
+                for r in reservoir_all:
+                    key = (r["consultation_id"], r.get("phase", "test"))
+                    if key in used:
+                        continue
+                    rr = dict(r)
+                    rr["audit_reason"] = "fill_random"
+                    selected.append(rr)
+                    used.add(key)
+                    if len(selected) >= audit_max_cases:
+                        break
+            selected = selected[:audit_max_cases]
+        # persist audit JSONL (case-level)
+        for r in selected:
+            store.record_case(r)
+        store.close()
+
+    if full_store is not None:
+        full_store.close()
+    if sqlite_store is not None:
+        sqlite_store.close()
+
+    # Compute per-method metrics
+    def method_summary(mname: str) -> Dict[str, Any]:
+        k = correct[mname]
+        n = n_test
+        acc = k / n if n else 0.0
+        lo, hi = wilson_ci(k, n)
+        mf1 = _macro_f1_from_cm(cm[mname], labels)
+        return {
+            "method": mname,
+            "n": n,
+            "accuracy": round(acc, 6),
+            "wilson_lo": round(lo, 6),
+            "wilson_hi": round(hi, 6),
+            "macro_f1": round(mf1, 6),
+        }
+
+    method_rows = [method_summary(m) for m in ["pure", "hybrid", "majority", "conf_weighted", "ds_only"]]
+
+    # Conditional accuracy (paper-ready):
+    # EPR (Expert Preservation Rate): P(correct | expert_correct)
+    # CCR (Coalition Correction Rate): P(correct | expert_wrong)
+    def _safe_div(a: int, b: int) -> Optional[float]:
+        return (a / b) if b else None
+
+    pure_epr = _safe_div(pure_correct_expert, expert_total)
+    pure_ccr = _safe_div(pure_correct_nonexpert, nonexpert_total)
+    hyb_epr = _safe_div(hyb_correct_expert, expert_total)
+    hyb_ccr = _safe_div(hyb_correct_nonexpert, nonexpert_total)
+
+    rad_mean = float(sum(rad_list) / len(rad_list)) if rad_list else 0.0
+    rad_sorted = sorted(rad_list) if rad_list else [0.0]
+    def _pct(p: float) -> float:
+        if not rad_sorted:
+            return 0.0
+        idx = int(round((len(rad_sorted)-1)*p))
+        idx = 0 if idx < 0 else (len(rad_sorted)-1 if idx >= len(rad_sorted) else idx)
+        return float(rad_sorted[idx])
+    rad_p50 = _pct(0.50)
+    rad_p95 = _pct(0.95)
+
+    # Add paired + operational to method_metrics (on the hybrid row for convenience)
+    for r in method_rows:
+        if r["method"] == "pure":
+            r.update({
+                "EPR_sroa": None if pure_epr is None else round(float(pure_epr), 6),
+                "CCR_sroa": None if pure_ccr is None else round(float(pure_ccr), 6),
+            })
+        if r["method"] == "hybrid":
+            r.update({
+                "paired_pure_correct_only": paired["pure_correct"],
+                "paired_hybrid_correct_only": paired["hybrid_correct"],
+                "paired_both_correct": paired["both_correct"],
+                "paired_both_wrong": paired["both_wrong"],
+                "EPR_sroa": None if hyb_epr is None else round(float(hyb_epr), 6),
+                "CCR_sroa": None if hyb_ccr is None else round(float(hyb_ccr), 6),
+                "rad_mean": round(rad_mean, 6),
+                "rad_p50": round(rad_p50, 6),
+                "rad_p95": round(rad_p95, 6),
+                "avg_message_count": round(msg_sum / n_test, 4) if n_test else 0.0,
+                "avg_attacks_total": round(hyb_attacks_sum / n_test, 4) if n_test else 0.0,
+                "avg_filtered_attacks": round(hyb_filtered_sum / n_test, 4) if n_test else 0.0,
+                "avg_defeats_total": round(hyb_defeats_sum / n_test, 4) if n_test else 0.0,
+                "filter_ratio_mean": round((hyb_filtered_sum / hyb_attacks_sum) if hyb_attacks_sum else 0.0, 6),
+                "trace_level": trace_level,
+                "use_sqlite": bool(use_sqlite) if trace_level == "full" else False,
+            })
+
+    # Case aggregates
+    case_agg_rows: List[Dict[str, Any]] = []
+    for lab in labels:
+        row = {"ground_truth": lab, "count": gt_counts.get(lab, 0)}
+        for m in ["pure", "hybrid", "majority", "conf_weighted", "ds_only"]:
+            row[f"pred_{m}"] = pred_counts[m].get(lab, 0)
+        case_agg_rows.append(row)
+
+    # Config (deterministic: no timestamps)
+    config = {
+        "author": "Omar Portilla Jaimes",
+        "email": "jorge.portilla2@unipamplona.edu.co",
+        "seed": seed,
+        "warmup": warmup,
+        "test": test,
+        "lam": lam,
+        "gamma": gamma,
+        "omega": omega,
+        "forgetting_rate": forgetting,
+        "eta_equivalent": 1.0 - forgetting,
+        "coalition_size": coalition_size,
+        "include_adversary": include_adversary,
+        "drop_rate": drop_rate,
+        "dup_rate": dup_rate,
+        "scenario_overrides": scenario_overrides or {},
+        "trace_level": trace_level,
+        "audit_policy": audit_policy,
+        "audit_max_cases": audit_max_cases,
+        "use_sqlite": bool(use_sqlite) if trace_level == "full" else False,
+        "hypotheses": labels,
+    }
+
+    # Fingerprints
+    sources = [
+        os.path.join(os.path.dirname(__file__), f)
+        for f in ["cli.py", "pipeline.py", "simulation.py", "sroa.py", "argumentation.py", "agents.py", "reputation.py", "metrics.py", "protocol.py", "design.py", "utils.py", "excelio.py"]
+    ]
+    code_fp = fingerprint_source(sources)
+    cfg_fp = sha256_text(stable_json(config))
+
+    config_out = os.path.join(outdir, "config.json")
+    write_json(config_out, {**config, "code_fingerprint": code_fp, "config_fingerprint": cfg_fp})
+
+    # Excel output
+    xlsx_path = os.path.join(outdir, "run_summary.xlsx")
+    sheets = {
+        "config": {"type": "kv", "items": list({**config, "code_fingerprint": code_fp, "config_fingerprint": cfg_fp}.items())},
+        "method_metrics": {"type": "dict_rows", "rows": method_rows},
+        "case_aggregate": {"type": "dict_rows", "rows": case_agg_rows},
+        "audit_cases": {"type": "dict_rows", "rows": selected if trace_level == "audit" else []},
+    }
+    save_workbook(xlsx_path, sheets)
+
+    # Lightweight CSV metrics for integrations
+    csv_path = os.path.join(outdir, "run_metrics.csv")
+    _write_run_metrics_csv(csv_path, config, method_rows)
+
+    # checksums (include only final artifacts; audit jsonl optional)
+    artifacts = [config_out, xlsx_path, csv_path]
+    if trace_level == "audit":
+        aj = os.path.join(outdir, "audit_cases.jsonl")
+        if os.path.exists(aj):
+            artifacts.append(aj)
+    if trace_level == "full":
+        cj = os.path.join(outdir, "cases_full.jsonl")
+        if os.path.exists(cj):
+            artifacts.append(cj)
+        if use_sqlite:
+            db = os.path.join(outdir, "event_store.sqlite")
+            if os.path.exists(db):
+                artifacts.append(db)
+    checks = compute_checksums(artifacts, root=outdir)
+    checks_out = os.path.join(outdir, "checksums.json")
+    write_json(checks_out, checks)
+
+    return {
+        "outdir": outdir,
+        "config_json": config_out,
+        "run_summary_xlsx": xlsx_path,
+        "run_metrics_csv": csv_path,
+        "checksums_json": checks_out,
+        "method_metrics": method_rows,
+        "case_aggregate": case_agg_rows,
+    }
+
+def _write_run_metrics_csv(path: str, config: Dict[str, Any], method_rows: List[Dict[str, Any]]) -> None:
+    import csv
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Flatten: one row per method
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=sorted({k for r in method_rows for k in r.keys()} | {f"cfg_{k}" for k in config.keys()}))
+        w.writeheader()
+        for r in method_rows:
+            row = {**{f"cfg_{k}": v for k, v in config.items()}, **r}
+            w.writerow(row)
+
+def _run_one_case(
+    case_idx: int,
+    phase: str,
+    scn: Scenario,
+    sroa_pure: SROA,
+    sroa_hyb: SROA,
+    drop_rate: float,
+    dup_rate: float,
+    sqlite_store: Optional[SqliteStore] = None,
+) -> Dict[str, Any]:
+    """Generate one synthetic case, build AF, run methods, update reputation."""
+    # Logical clock as operational proxy (events suppressed in v5 default)
+    clock = 0
+
+    def tick(payload: Optional[Dict[str, Any]] = None) -> None:
+        nonlocal clock
+        clock += 1
+        if sqlite_store is not None and payload is not None:
+            sqlite_store.append_event(consultation_id=cid, logical_clock=clock, payload=payload)
+
+    cid = f"CID-{case_idx:06d}"
+    agents = build_agents(scn)
+    ground_truth = random.choice(HYPOTHESES)
+    tick({"type": "GROUND_TRUTH", "value": ground_truth, "phase": phase})
+
+    # evidence events (not used by decision; kept for structure)
+    for i in range(4):
+        if random.random() < drop_rate:
+            continue
+        tick({"type": "EVIDENCE", "evidence_id": f"EV-{case_idx:06d}-{i:02d}", "hint": ground_truth})
+        if random.random() < dup_rate:
+            tick({"type": "EVIDENCE_DUP", "evidence_id": f"EV-{case_idx:06d}-{i:02d}", "hint": ground_truth})
+
+    # proposals
+    proposals: Dict[str, Any] = {}
+    af = AF()
+    agent_pred: Dict[str, str] = {}
+    expert_arg_id = ""
+
+    for ag in agents:
+        prop = ag.propose(HYPOTHESES, ground_truth)
+        proposals[ag.agent_id] = prop
+        agent_pred[ag.agent_id] = prop.hypothesis
+        arg_id = prop.arg_id
+        if ag.agent_id == "A1":
+            expert_arg_id = arg_id
+        af.add_argument(Argument(arg_id=arg_id, agent_id=ag.agent_id, hypothesis=prop.hypothesis, confidence=prop.confidence))
+        tick({"type": "ARG_PROPOSE", "agent": ag.agent_id, "arg_id": arg_id, "hyp": prop.hypothesis, "conf": prop.confidence})
+
+    # attacks
+    arg_by_agent: Dict[str, List[str]] = defaultdict(list)
+    for a in af.args.values():
+        arg_by_agent[a.agent_id].append(a.arg_id)
+
+    # Each agent may attack others
+    for ag in agents:
+        if random.random() > ag.attack_rate:
+            continue
+        # Choose target argument
+        if ag.target_expert_bias > 0 and random.random() < ag.target_expert_bias:
+            target = expert_arg_id
+        else:
+            # pick a non-self argument
+            candidates = [a.arg_id for a in af.args.values() if a.agent_id != ag.agent_id]
+            if not candidates:
+                continue
+            target = random.choice(candidates)
+        attacker = proposals[ag.agent_id].arg_id
+        af.add_attack(attacker, target)
+        tick({"type": "ARG_ATTACK", "from": attacker, "to": target})
+
+        # occasional extra attacks (coalition reinforcement)
+        if random.random() < ag.attack_rate * 0.20:
+            candidates = [a.arg_id for a in af.args.values() if a.agent_id != ag.agent_id and a.arg_id != target]
+            if candidates:
+                t2 = random.choice(candidates)
+                af.add_attack(attacker, t2)
+                tick({"type": "ARG_ATTACK", "from": attacker, "to": t2})
+
+    # baselines
+    counts = Counter([a.hypothesis for a in af.args.values()])
+    majority = counts.most_common(1)[0][0]
+    cw = defaultdict(float)
+    for a in af.args.values():
+        cw[a.hypothesis] += a.confidence
+    conf_weighted = max(cw.items(), key=lambda kv: kv[1])[0]
+    ds_only = max(af.args.values(), key=lambda x: x.confidence).hypothesis
+
+    # interaction graph edges (agent->agent)
+    agent_ids = sorted(arg_by_agent.keys())
+    idx = {aid: i for i, aid in enumerate(agent_ids)}
+    edges = [(idx[af.args[u].agent_id], idx[af.args[v].agent_id]) for (u, v) in af.attacks] if af.attacks else []
+
+    pure_pred, pure_expl = sroa_pure.decide(af, edges, idx)
+    hyb_pred, hyb_expl = sroa_hyb.decide(af, edges, idx)
+
+    # update reps
+    sroa_pure.update_reputation(agent_pred, ground_truth)
+    sroa_hyb.update_reputation(agent_pred, ground_truth)
+
+    expert_h = af.args[expert_arg_id].hypothesis if expert_arg_id in af.args else None
+    expert_correct = (expert_h == ground_truth) if expert_h is not None else False
+
+    pure_correct = (pure_pred == ground_truth)
+    hyb_correct = (hyb_pred == ground_truth)
+
+    audit_row = {
+        "consultation_id": cid,
+        "phase": phase,
+        "ground_truth": ground_truth,
+        "pred_pure": pure_pred,
+        "pred_hybrid": hyb_pred,
+        "pure_correct": pure_correct,
+        "hybrid_correct": hyb_correct,
+        "expert_hypothesis": expert_h,
+        "expert_correct": expert_correct,
+        "accepted_args_pure": pure_expl.get("accepted_args_count", None),
+        "accepted_args_hybrid": hyb_expl.get("accepted_args_count", None),
+        "defeats_total": hyb_expl.get("defeats_total", None),
+        "filtered_attacks": hyb_expl.get("filtered_attacks", None),
+        "support_score_top3": _topk_support(hyb_expl.get("support_score", {}), k=3),
+    }
+
+    full_record = {
+        "consultation_id": cid,
+        "phase": phase,
+        "ground_truth": ground_truth,
+        "predictions": {
+            "sroa_pure": pure_pred,
+            "sroa_hybrid": hyb_pred,
+            "majority": majority,
+            "conf_weighted": conf_weighted,
+            "ds_only": ds_only,
+        },
+        "message_count": clock,
+        "explanation_pure": pure_expl,
+        "explanation_hybrid": hyb_expl,
+        "expert_hypothesis": expert_h,
+        "expert_correct": expert_correct,
+    }
+
+    return {
+        "consultation_id": cid,
+        "phase": phase,
+        "ground_truth": ground_truth,
+        "pred_pure": pure_pred,
+        "pred_hybrid": hyb_pred,
+        "pred_majority": majority,
+        "pred_conf_weighted": conf_weighted,
+        "pred_ds_only": ds_only,
+        "pure_correct": pure_correct,
+        "hybrid_correct": hyb_correct,
+        "majority_correct": (majority == ground_truth),
+        "conf_weighted_correct": (conf_weighted == ground_truth),
+        "ds_only_correct": (ds_only == ground_truth),
+        "message_count": clock,
+        "hyb_attacks_total": int(hyb_expl.get("attacks_total", 0) or 0),
+        "hyb_defeats_total": int(hyb_expl.get("defeats_total", 0) or 0),
+        "hyb_filtered_attacks": int(hyb_expl.get("filtered_attacks", 0) or 0),
+        "audit_row": audit_row,
+        "full_record": full_record,
+    }
+
+def _topk_support(support_score: Dict[str, Any], k: int = 3) -> str:
+    if not support_score:
+        return ""
+    items = [(str(h), float(v)) for h, v in support_score.items()]
+    items.sort(key=lambda x: x[1], reverse=True)
+    items = items[:k]
+    return ";".join([f"{h}:{v:.4f}" for h, v in items])
+
+
+def summarize_results(path: str, out_xlsx: str | None = None) -> Dict[str, Any]:
+    """Summarize a JSONL file produced in --trace-level full mode.
+
+    This is retained for backward-compatibility and for debugging.
+    For paper-ready outputs in v5, prefer run_summary.xlsx produced by `compare`/`pipeline`.
+    """
+    import json
+    recs: List[Dict[str, Any]] = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                recs.append(json.loads(line))
+    if not recs:
+        out = {"n": 0}
+        if out_xlsx:
+            save_workbook(out_xlsx, {"empty": {"type": "kv", "items": [("n", 0)]}})
+        return out
+
+    # expecting full_record schema
+    y = [r["ground_truth"] for r in recs]
+    methods = sorted(list(recs[0].get("predictions", {}).keys()))
+    labels = sorted(set(y) | set([p for r in recs for p in r.get("predictions", {}).values()]))
+
+    # compute metrics
+    rows = []
+    for m in methods:
+        yp = [r["predictions"][m] for r in recs]
+        k = sum(1 for yt, yp_ in zip(y, yp) if yt == yp_)
+        n = len(y)
+        acc = k / n if n else 0.0
+        lo, hi = wilson_ci(k, n)
+        # confusion
+        cm_m = {t: defaultdict(int) for t in labels}
+        for yt, yp_ in zip(y, yp):
+            cm_m[yt][yp_] += 1
+        mf1 = _macro_f1_from_cm(cm_m, labels)
+        rows.append({"method": m, "n": n, "accuracy": acc, "wilson_lo": lo, "wilson_hi": hi, "macro_f1": mf1})
+
+    out = {"n": len(recs), "methods": methods, "metrics": rows}
+
+    if out_xlsx:
+        save_workbook(out_xlsx, {
+            "summary": {"type": "dict_rows", "rows": rows},
+        })
+    return out
+
+
+def run_compare_metrics_only(
+    seed: int,
+    warmup: int,
+    test: int,
+    lam: float,
+    gamma: float,
+    omega: float,
+    forgetting: float,
+    coalition_size: int,
+    include_adversary: bool,
+    drop_rate: float = 0.0,
+    dup_rate: float = 0.0,
+    scenario_overrides: Optional[Dict[str, Any]] = None,
+    audit_max_cases: int = 0,
+    audit_policy: str = "diff",
+    log_every_cases: int = 0,
+) -> Dict[str, Any]:
+    """Fast in-memory compare for sensitivity runs (no SQLite, no JSONL, no Excel).
+
+    Returns aggregated metrics and (optional) a small audit reservoir.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+
+    scn = Scenario(coalition_size=coalition_size, include_adversary=include_adversary)
+    if scenario_overrides:
+        for k, v in scenario_overrides.items():
+            if hasattr(scn, k):
+                setattr(scn, k, v)
+
+    agent_ids = ["A1"] + [f"A{i}" for i in range(2, 2 + coalition_size)] + (["A_adv"] if include_adversary else [])
+    sroa_pure = SROA(agent_ids, SROAConfig(mode="pure", lam=lam, gamma=gamma, omega=omega, forgetting=forgetting))
+    sroa_hyb = SROA(agent_ids, SROAConfig(mode="hybrid", lam=lam, gamma=gamma, omega=omega, forgetting=forgetting))
+
+    labels = HYPOTHESES
+    cm: Dict[str, Dict[str, Dict[str, int]]] = {m: {t: defaultdict(int) for t in labels} for m in ["pure", "hybrid"]}
+    correct = {"pure": 0, "hybrid": 0}
+    paired = {"pure_correct_only": 0, "hybrid_correct_only": 0, "both_correct": 0, "both_wrong": 0}
+
+    msg_sum = 0
+    hyb_attacks_sum = 0
+    hyb_defeats_sum = 0
+    hyb_filtered_sum = 0
+    rad_list: List[float] = []
+
+    # Conditional metrics: EPR/CCR
+    expert_total = 0
+    nonexpert_total = 0
+    pure_correct_expert = 0
+    pure_correct_nonexpert = 0
+    hyb_correct_expert = 0
+    hyb_correct_nonexpert = 0
+
+    # audit reservoir
+    audit_policy = (audit_policy or "diff").lower()
+    rng_audit = random.Random(seed ^ 0xA11D)
+    reservoir: List[Dict[str, Any]] = []
+    stream_i = 0
+
+    for i in range(warmup):
+        _run_one_case(i, "warmup", scn, sroa_pure, sroa_hyb, drop_rate, dup_rate, sqlite_store=None)
+
+    for i in range(test):
+        case = _run_one_case(i, "test", scn, sroa_pure, sroa_hyb, drop_rate, dup_rate, sqlite_store=None)
+        gt = case["ground_truth"]
+        p_ok = case["pure_correct"]
+        h_ok = case["hybrid_correct"]
+
+        cm["pure"][gt][case["pred_pure"]] += 1
+        cm["hybrid"][gt][case["pred_hybrid"]] += 1
+
+        if p_ok:
+            correct["pure"] += 1
+        if h_ok:
+            correct["hybrid"] += 1
+
+        if p_ok and h_ok:
+            paired["both_correct"] += 1
+        elif (not p_ok) and (not h_ok):
+            paired["both_wrong"] += 1
+        else:
+            if p_ok:
+                paired["pure_correct_only"] += 1
+            if h_ok:
+                paired["hybrid_correct_only"] += 1
+
+        msg_sum += case["message_count"]
+        hyb_attacks_sum += case.get("hyb_attacks_total", 0)
+        hyb_defeats_sum += case.get("hyb_defeats_total", 0)
+        hyb_filtered_sum += case.get("hyb_filtered_attacks", 0)
+        at = case.get("hyb_attacks_total", 0)
+        fa = case.get("hyb_filtered_attacks", 0)
+        rad_list.append((fa / at) if at else 0.0)
+
+        expert_ok = bool(case["audit_row"].get("expert_correct", False))
+        if expert_ok:
+            expert_total += 1
+            if p_ok:
+                pure_correct_expert += 1
+            if h_ok:
+                hyb_correct_expert += 1
+        else:
+            nonexpert_total += 1
+            if p_ok:
+                pure_correct_nonexpert += 1
+            if h_ok:
+                hyb_correct_nonexpert += 1
+
+        # audit reservoir update
+        if audit_max_cases and audit_max_cases > 0:
+            stream_i += 1
+            row = case["audit_row"]
+            match = False
+            if audit_policy == "random":
+                match = True
+            elif audit_policy == "diff":
+                match = row["pred_pure"] != row["pred_hybrid"]
+            elif audit_policy == "pure_fail":
+                match = not row["pure_correct"]
+            elif audit_policy == "hybrid_fail":
+                match = not row["hybrid_correct"]
+            if match:
+                _reservoir_update(reservoir, row, audit_max_cases, stream_i, rng_audit)
+
+        if log_every_cases and ((i + 1) % log_every_cases == 0 or (i + 1) == test):
+            print(f"[sensitivity-run] seed={seed} {i+1}/{test} cases")
+
+    n = test
+    pure_acc = correct["pure"] / n if n else 0.0
+    hyb_acc = correct["hybrid"] / n if n else 0.0
+    pure_f1 = _macro_f1_from_cm(cm["pure"], labels)
+    hyb_f1 = _macro_f1_from_cm(cm["hybrid"], labels)
+
+    def _safe_div(a: int, b: int) -> Optional[float]:
+        return (a / b) if b else None
+
+    pure_epr = _safe_div(pure_correct_expert, expert_total)
+    pure_ccr = _safe_div(pure_correct_nonexpert, nonexpert_total)
+    hyb_epr = _safe_div(hyb_correct_expert, expert_total)
+    hyb_ccr = _safe_div(hyb_correct_nonexpert, nonexpert_total)
+
+    rad_mean = float(sum(rad_list) / len(rad_list)) if rad_list else 0.0
+    rad_sorted = sorted(rad_list) if rad_list else [0.0]
+    def _pct(p: float) -> float:
+        idx = int(round((len(rad_sorted) - 1) * p))
+        idx = 0 if idx < 0 else (len(rad_sorted) - 1 if idx >= len(rad_sorted) else idx)
+        return float(rad_sorted[idx])
+    rad_p50 = _pct(0.50)
+    rad_p95 = _pct(0.95)
+
+    return {
+        "n": n,
+        "pure_accuracy": pure_acc,
+        "hybrid_accuracy": hyb_acc,
+        "pure_macro_f1": pure_f1,
+        "hybrid_macro_f1": hyb_f1,
+        "paired_pure_correct_only": paired["pure_correct_only"],
+        "paired_hybrid_correct_only": paired["hybrid_correct_only"],
+        "paired_both_correct": paired["both_correct"],
+        "paired_both_wrong": paired["both_wrong"],
+        "avg_message_count": (msg_sum / n) if n else 0.0,
+        "avg_attacks_total": (hyb_attacks_sum / n) if n else 0.0,
+        "avg_filtered_attacks": (hyb_filtered_sum / n) if n else 0.0,
+        "avg_defeats_total": (hyb_defeats_sum / n) if n else 0.0,
+        "filter_ratio_mean": (hyb_filtered_sum / hyb_attacks_sum) if hyb_attacks_sum else 0.0,
+        "EPR_sroa_pure": pure_epr,
+        "CCR_sroa_pure": pure_ccr,
+        "EPR_sroa_hybrid": hyb_epr,
+        "CCR_sroa_hybrid": hyb_ccr,
+        "rad_mean": rad_mean,
+        "rad_p50": rad_p50,
+        "rad_p95": rad_p95,
+        "audit_cases": reservoir,
+    }
+
+
+
+==================================================
+ARCHIVO: .\sroa.py
+==================================================
+from __future__ import annotations
+
+"""Author: Omar Portilla Jaimes
+Email: jorge.portilla2@unipamplona.edu.co
+"""
+
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional, Any
+
+from .argumentation import AF, grounded_extension, induced_defeat_graph
+from .reputation import BetaRep, katz_centrality, fuse_reputation
+
+@dataclass
+class SROAConfig:
+    mode: str = "pure"  # pure | hybrid
+    lam: float = 1.25
+    gamma: float = 2.0
+    omega: float = 0.8
+    forgetting: float = 0.01
+    eps: float = 1e-6
+
+class SROA:
+    def __init__(self, agent_ids: List[str], config: Optional[SROAConfig] = None):
+        self.cfg = config or SROAConfig()
+        self.hist: Dict[str, BetaRep] = {aid: BetaRep() for aid in agent_ids}
+
+    def decide(self, af: AF, agent_edges: List[Tuple[int, int]], agent_index: Dict[str, int]) -> Tuple[str, Dict[str, Any]]:
+        ctx_vec = katz_centrality(num_nodes=len(agent_index), edges=agent_edges, alpha=0.1, beta=1.0)
+        ctx = {aid: float(ctx_vec[idx]) for aid, idx in agent_index.items()}
+        rep = fuse_reputation(self.hist, ctx, omega=self.cfg.omega)
+
+        weights: Dict[str, float] = {}
+        for a_id, a in af.args.items():
+            r = rep.get(a.agent_id, 0.5)
+            weights[a_id] = (r + self.cfg.eps) ** self.cfg.gamma * (a.confidence + self.cfg.eps)
+
+        if self.cfg.mode == "hybrid":
+            af_used = induced_defeat_graph(af, weights, self.cfg.lam)
+        else:
+            af_used = af
+
+        G = grounded_extension(af_used)
+
+        score: Dict[str, float] = {}
+        for a_id in G:
+            a = af.args[a_id]
+            score.setdefault(a.hypothesis, 0.0)
+            score[a.hypothesis] += weights[a_id] if self.cfg.mode == "hybrid" else a.confidence
+
+        if not score:
+            best = max(af.args.values(), key=lambda x: x.confidence)
+            pred = best.hypothesis
+        else:
+            pred = max(score.items(), key=lambda kv: kv[1])[0]
+
+        expl = {
+            "accepted_args_count": len(G),
+            "candidate_hypotheses_count": len({a.hypothesis for a in af.args.values()}),
+            "support_score": {k: float(v) for k, v in score.items()},
+            "mode": self.cfg.mode,
+            "lambda": self.cfg.lam,
+            "gamma": self.cfg.gamma,
+            "omega": self.cfg.omega,
+        }
+        if self.cfg.mode == "hybrid":
+            expl["attacks_total"] = len(af.attacks)
+            expl["defeats_total"] = len(af_used.attacks)
+            expl["filtered_attacks"] = len(af.attacks) - len(af_used.attacks)
+        return pred, expl
+
+    def update_reputation(self, agent_pred: Dict[str, str], ground_truth: str) -> None:
+        for aid, pred in agent_pred.items():
+            self.hist[aid].update(success=(pred == ground_truth), forgetting=self.cfg.forgetting)
+
+
+==================================================
+ARCHIVO: .\utils.py
+==================================================
+from __future__ import annotations
+
+"""Author: Omar Portilla Jaimes
+Email: jorge.portilla2@unipamplona.edu.co
+"""
+
+import hashlib
+import json
+import os
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+def fingerprint_source(sources) -> str:
+    """Compute a deterministic SHA256 fingerprint of source code.
+
+    Parameters
+    ----------
+    sources:
+        Either a package directory (str/Path) or an iterable of file paths.
+
+    Notes
+    -----
+    * Deterministic: paths are sorted; each file is hashed by path + raw bytes.
+    * Designed for Q1-grade reproducibility (stable across runs).
+    """
+    # Normalize inputs to a list of files
+    if isinstance(sources, (str, Path)):
+        root = Path(sources)
+        files = sorted(root.rglob("*.py"))
+    else:
+        files = sorted(Path(p) for p in sources)
+
+    h = hashlib.sha256()
+    for f in files:
+        if f.is_file():
+            h.update(str(f).encode("utf-8"))
+            h.update(b"\n")
+            h.update(f.read_bytes())
+            h.update(b"\n")
+    return h.hexdigest()
+
+
+def write_json(path: str, obj) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+def write_text(path: str, text: str) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+def compute_checksums(paths: List[str], root: str | None = None) -> Dict[str, str]:
+    """Compute SHA256 for a list of files.
+
+    If root is provided, keys are relative paths from root (POSIX-style).
+    Otherwise keys are basenames (legacy behavior).
+    """
+    out: Dict[str, str] = {}
+    for p in paths:
+        if not os.path.exists(p):
+            continue
+        key = os.path.basename(p)
+        if root is not None:
+            try:
+                key = str(Path(p).resolve().relative_to(Path(root).resolve())).replace(os.sep, "/")
+            except Exception:
+                key = os.path.basename(p)
+        out[key] = sha256_file(p)
+    return out
+
+
+def stable_json(obj) -> str:
+    """Deterministic JSON serialization (sorted keys, compact)."""
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+==================================================
+ARCHIVO: .\__init__.py
+==================================================
+__all__ = ['cli','simulation','sroa','argumentation','reputation','protocol','agents','metrics','design','pipeline','utils','excelio']
+__version__='0.6.0'
+
