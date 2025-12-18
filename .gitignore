@@ -13,6 +13,7 @@ venv/
 # Ignorar carpetas de salida específicas
 out_eta_f001/
 out_eta_f005/
+otros/
 # IDE
 .vscode/
 .idea/
